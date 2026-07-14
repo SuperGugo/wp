@@ -1,4 +1,18 @@
 // wp - VT100 word processor loosely based on antirez's kilo
+//
+// planned features:
+// (x) basic text editing
+// (x) file open/save
+// (x) word line wrapping
+// (x) utf8 support
+// ( ) find/replace
+// ( ) a nice status bar
+// ( ) ctrl+arrows to move between words (horizontal) or phys rows (vertical), ctrl+backspace/del to delete a word
+// ( ) shift+arrows to select, shift+del to delete a physical row
+// ( ) indentation on the first lline of phys rows
+// ( ) history, undo/redo
+// ( ) somewhat decent performance
+
 #define _DEFAULT_SOURCE
 #define _BSD_SOURCE
 #define _GNU_SOURCE
@@ -19,7 +33,7 @@
 
 enum editorKey {
     BACKSPACE = 127,
-    ARROW_LEFT = 1000,
+    ARROW_LEFT = 256,
     ARROW_RIGHT,
     ARROW_UP,
     ARROW_DOWN,
@@ -27,7 +41,10 @@ enum editorKey {
     HOME_KEY,
     END_KEY,
     PAGE_UP,
-    PAGE_DOWN
+    PAGE_DOWN,
+    ESCAPE_KEY,
+    UNKNOWN_TWO_CHAR = 0x222,
+    UNKNOWN_THREE_CHAR = 0x333
 };
 
 enum editorMessage {
@@ -40,28 +57,37 @@ enum editorMessage {
 typedef struct erow {
   int size;
   char *chars;
+
+  int columns; // utf-8 size
 } erow;
 
 typedef struct elline {
-  int size;
-  int refIdx;
-  int offset;
+    int refIdx;
+
+    int size; // strictly in bytes
+    int phys_size;
+    
+    int offset; // strictly in bytes
+    int phys_offset;
 } elline;
 
 struct editorConfig {
     int cx, cy; // cursor position
+    int bidx;
     int scroll;
 
     int screenrows;
     int screencols;
 
+    int editflag;
     int insMode;
-    char lastKeypress;
+    int lastkey;
 
+    int bytecount; // do I need this?
     int charcount;
     int wordcount;
 
-    int statusMessage;
+    int statusmsg;
 
     int numrows;
     erow *row;
@@ -76,25 +102,46 @@ struct editorConfig {
 
 struct editorConfig E; // the editor state
 
+/* utf-8 utils */
+size_t utf8_next(const char *s, size_t pos) {
+    int i = 1;
+    while ((s[pos+i] & 0xC0) == 0x80) {
+        i++;
+    }
+    return i;
+}
+
+size_t utf8_prev(const char *s, size_t pos) {
+    if (pos == 0) return 0;
+    int i = 1;
+    while ((s[pos-i] & 0xC0) == 0x80) i++;
+    return i;
+}
+
 /* Terminal */
 
-int currentRow() {
+int currentLLine() {
     return E.cy+E.scroll;
 }
 
 int physicalRow() {
-    if (currentRow() == E.numllines) return E.numrows;
-    return E.lline[currentRow()].refIdx;
+    if (currentLLine() == E.numllines) return -1;
+    return E.lline[currentLLine()].refIdx;
 }
 
 int physicalRowOffset() {
-    if (currentRow() == E.numllines) return E.numrows;
-    return E.lline[currentRow()].offset;
+    if (currentLLine() == E.numllines) return 0;
+    return E.lline[currentLLine()].offset;
+}
+
+int physicalRowColumnOffset() {
+    if (currentLLine() == E.numllines) return 0;
+    return E.lline[currentLLine()].phys_offset;
 }
 
 void clearScreen() {
-    write(STDOUT_FILENO, "\x1b[2J", 4); // Erase In Display, entire screen
-    write(STDOUT_FILENO, "\x1b[H", 3); // Cursor Position, zero
+    write(STDOUT_FILENO, "\e[2J", 4); // Erase In Display, entire screen
+    write(STDOUT_FILENO, "\e[H", 3); // Cursor Position, zero
 }
 
 void die(const char *s) {
@@ -142,7 +189,7 @@ int getCursorPosition(int *rows, int *cols) {
     char buf[32];
     unsigned int i = 0;
     // we ask the terminal where the fuck the cursor is
-    if (write(STDOUT_FILENO, "\x1b[6n", 4) != 4) return -1;
+    if (write(STDOUT_FILENO, "\e[6n", 4) != 4) return -1;
     while (i < sizeof(buf) - 1) {
         if (read(STDIN_FILENO, &buf[i], 1) != 1) break;
         if (buf[i] == 'R') break;
@@ -150,7 +197,7 @@ int getCursorPosition(int *rows, int *cols) {
     }
     // we decipher the response
     buf[i] = '\0';
-    if (buf[0] != '\x1b' || buf[1] != '[') return -1;
+    if (buf[0] != '\e' || buf[1] != '[') return -1;
     if (sscanf(&buf[2], "%d;%d", rows, cols) != 2) return -1;
     return 0;
 }
@@ -161,7 +208,7 @@ int getWindowSize(int *rows, int *cols) {
     // We get the size of the terminal using the trivial TIOCGWINSZ command (Terminal Input Output Control Get WINdow SiZe)
       if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == -1 || ws.ws_col == 0) {
         // If TIOCGWINSZ fails, move the cursor to the depths of hell and pick him up
-        if (write(STDOUT_FILENO, "\x1b[999C\x1b[999B", 12) != 12) return -1;
+        if (write(STDOUT_FILENO, "\e[999C\e[999B", 12) != 12) return -1;
         return getCursorPosition(rows, cols);
     } else {
         *cols = ws.ws_col;
@@ -172,32 +219,91 @@ int getWindowSize(int *rows, int *cols) {
 
 /* logical line processing */
 
-void editorAppendLLine(int refIdx, int start, size_t len) {
+int isPunctuation(char c) {
+    // can i wrap on this character?
+    return c == ' ' || c == ',' || c == '.' || c == ';' || c == ':' || c == '/' || c == '-' || c == '?' || c == '!';
+}
+
+void editorAppendLLine(int refIdx, int start, size_t len, int startcol, size_t collen) {
     E.lline = realloc(E.lline, sizeof(elline) * (E.numllines + 1));
     int at = E.numllines;
     E.lline[at].size = len;
     E.lline[at].refIdx = refIdx;
     E.lline[at].offset = start;
+    E.lline[at].phys_size = collen;
+    E.lline[at].phys_offset = startcol;
     E.numllines++;
 }
 
+// TODO: maybe don't recompute ALL THE LLINES, iterating EVERY CHARACTER, for every keypress?
 void editorComputeLLines() {
     free(E.lline);
+
+    // We also count lines, words and characters while recomputing llines, since we go over all of them.
     E.numllines = 0;
+    E.wordcount = 0;
+    E.charcount = 0;
+
     E.lline = NULL;
-    for (int i = 0; i < E.numrows; ++i) {
-        int len = E.row[i].size;
-        int x = 0;
-        while (len >= E.screencols) {
-            editorAppendLLine(i, x, E.screencols-1);
-            x += E.screencols-1;
-            len -= E.screencols-1;
+    for (int y = 0; y < E.numrows; ++y) {
+        int len = E.row[y].size;
+        E.row[y].columns = 0;
+
+        E.bytecount += len; // add the row's size (in bytes) to the byte counter
+
+        // if the row is too long, wrap it
+        int lastspc = 0;
+        int llen = 0; // length of current logical line
+        int lstart = 0; // start of the current logical line
+
+        int lastcol = 0;
+        int columns = 0; // the actual rendered columns, for utf-8
+
+        for (int x = 0; x < len;) {
+            /*
+            // divide at punctuation
+            if (isPunctuation(E.row[y].chars[x]))  {
+                // cutting here would overflow. cut at the last valid position.
+                // if the last word is too long to fit in the line anyway, even if it was alone, then it is to be split
+                if (x-lstart+1 >= E.screencols 
+                    //&& x-lastspc < E.screencols
+                ) {
+                    if (lastspc-lstart+1 >= E.screencols) {
+                        // if the single word is larger than the goddamn screen split it
+                        editorAppendLLine(y, lstart, E.screencols-1);
+                        lstart += E.screencols-1;
+                    } else {
+                        // wrap normally
+                        editorAppendLLine(y, lstart, lastspc-lstart+1);
+                        lstart = lastspc+1;
+                    }
+                }
+
+                lastspc = x; // blocks of punctuation stick together.
+                //while (isPunctuation(E.row[y].chars[x++]));
+
+                E.wordcount++;
+            }
+            */
+            if (columns == 30) {
+                editorAppendLLine(y, lastspc, x-lastspc, lastcol, columns);
+                lastspc = x;
+                lastcol += columns;
+                columns = 0;
+            }
+            int add = utf8_next(E.row[y].chars, x);
+            if (add == 0) break;
+            x += add;
+            columns++;
+            E.charcount++;
+            E.row[y].columns++;
         }
-        editorAppendLLine(i, x, len);
+
+        editorAppendLLine(y, lastspc, len-lastspc, lastcol, columns);
     }
 }
 
-/* rows */
+/* rows processing */
 
 void editorAppendRow(char *s, size_t len) {
     E.row = realloc(E.row, sizeof(erow) * (E.numrows + 1));
@@ -247,54 +353,57 @@ void abFree(struct abuf *ab) {
 
 /* output processing */
 
-void editorDrawStatusBar(struct abuf *ab) {
+void editorDrawStatbar(struct abuf *ab) {
     // render the status bar
-    abAppend(ab, "} wp word processor  ", 21);
+    abAppend(ab, "\e[0;30m\e[47m} wp word processor  ", 33);
 
     char tmp[32];
     int len;
 
-    if (E.lastKeypress > ' ' && E.lastKeypress < '~') {
-        len = snprintf(tmp, sizeof(tmp), "%c", E.lastKeypress);
+    if (E.lastkey > ' ' && E.lastkey < '~') {
+        len = snprintf(tmp, sizeof(tmp), "%c", E.lastkey);
     } else {
-        len = snprintf(tmp, sizeof(tmp), "0x%X", E.lastKeypress);
+        len = snprintf(tmp, sizeof(tmp), "0x%X", E.lastkey);
     }
 
     char buf[256];
-    //len = snprintf(buf, sizeof(buf), "%*s", E.screencols-22, tmp);
+    len = snprintf(buf, sizeof(buf), " [ %s ] ", tmp);
 
-    len = snprintf(buf, sizeof(buf), "line %d of %d ~ %d/%d ~ %dc %dw ", 
+    abAppend(ab, buf, len);
+
+    len = snprintf(buf, sizeof(buf), "line %d of %d ~ %d (%d)/%d (%d) ~ %dc %dw %s", 
         physicalRow()+1,
         E.numrows,
-        (currentRow() == E.numllines) ? 0 : E.cx + physicalRowOffset(), 
-        (currentRow() == E.numllines) ? 0 : E.row[physicalRow()].size,
+        (currentLLine() == E.numllines) ? 0 : E.cx + physicalRowColumnOffset(), 
+        (currentLLine() == E.numllines) ? 0 : E.bidx, 
+        (currentLLine() == E.numllines) ? 0 : E.row[physicalRow()].columns,
+        (currentLLine() == E.numllines) ? 0 : E.row[physicalRow()].size,
         E.charcount,
-        E.wordcount
+        E.wordcount,
+        E.editflag ? "* " : ""
     );
 
     abAppend(ab, buf, len);
 
 
-    if (E.statusMessage != 0) {
-        char msg[256];
-        switch (E.statusMessage) {
+    if (E.statusmsg != 0) {
+        switch (E.statusmsg) {
             case SAVING:
-                len = snprintf(msg, sizeof(msg), "Saving...");
+                abAppend(ab, "Saving...", 9);
                 break;
             case SAVED:
-                len = snprintf(msg, sizeof(msg), "Saved");
+                abAppend(ab, "Saved", 5);
                 break;
         }
-
-        abAppend(ab, msg, len);
     }
     
+    abAppend(ab, "\e[0m", 4);
 }
 
 void editorDrawRows(struct abuf *ab) {
     for (int y = 0; y < E.screenrows; ++y) {
         if (y == E.screenrows - 1) {
-            editorDrawStatusBar(ab);
+            editorDrawStatbar(ab);
         } else if (y >= E.numllines-E.scroll) {
             abAppend(ab, "~", 3);
         } else {
@@ -309,7 +418,7 @@ void editorDrawRows(struct abuf *ab) {
             free(buf);
         }
 
-        abAppend(ab, "\x1b[K", 3); // Erase In Line
+        abAppend(ab, "\e[K", 3); // Erase In Line
 
         if (y < E.screenrows - 1) {
             abAppend(ab, "\r\n", 2);
@@ -320,18 +429,18 @@ void editorDrawRows(struct abuf *ab) {
 void editorRefreshScreen() {
     struct abuf ab = ABUF_INIT;
 
-    abAppend(&ab, "\x1b[?25l", 6); // Hides the cursor
+    abAppend(&ab, "\e[?25l", 6); // Hides the cursor
     
-    abAppend(&ab, "\x1b[H", 3);  // Cursor Position, zero
+    abAppend(&ab, "\e[H", 3);  // Cursor Position, zero
 
     editorDrawRows(&ab);
 
     // move the cursor where we left it
     char buf[32];
-    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", E.cy + 1, E.cx + 1);
+    snprintf(buf, sizeof(buf), "\e[%d;%dH", E.cy + 1, E.cx + 1);
     abAppend(&ab, buf, strlen(buf));
 
-    abAppend(&ab, "\x1b[?25h", 6); // Brings the cursor back!
+    abAppend(&ab, "\e[?25h", 6); // Brings the cursor back!
 
     write(STDOUT_FILENO, ab.b, ab.len); // print the whole buffer
     abFree(&ab);
@@ -370,7 +479,7 @@ void editorOpen(char *filename) {
 
 void editorSave(char *filename) {
     // open file
-    E.statusMessage = SAVING;
+    E.statusmsg = SAVING;
     editorRefreshScreen();
     FILE *fp = fopen(filename, "w");
     if (!fp) die("fopen");
@@ -381,7 +490,8 @@ void editorSave(char *filename) {
     }
 
     fclose(fp);
-    E.statusMessage = SAVED;
+    E.editflag = 0;
+    E.statusmsg = SAVED;
 }
 
 /* input processing */
@@ -393,15 +503,15 @@ int editorReadKey() {
         if (nread == -1 && errno != EAGAIN) die("read");
     }
 
-    // process escape characters: if we read 0x1b we read the next 2 characters
+    // process escape characters: if we read 0e we read the next 2 characters
     // theres surprisingly many ways to do home and end
-    if (c == '\x1b') {
+    if (c == '\e') {
         char seq[3];
-        if (read(STDIN_FILENO, &seq[0], 1) != 1) return '\x1b';
-        if (read(STDIN_FILENO, &seq[1], 1) != 1) return '\x1b';
+        if (read(STDIN_FILENO, &seq[0], 1) != 1) return ESCAPE_KEY; // the actual escape key
+        if (read(STDIN_FILENO, &seq[1], 1) != 1) return UNKNOWN_TWO_CHAR;
         if (seq[0] == '[') {
             if (seq[1] >= '0' && seq[1] <= '9') {
-                if (read(STDIN_FILENO, &seq[2], 1) != 1) return '\x1b';
+                if (read(STDIN_FILENO, &seq[2], 1) != 1) return '\e';
                 if (seq[2] == '~') {
                 switch (seq[1]) {
                     case '1': return HOME_KEY;
@@ -417,214 +527,273 @@ int editorReadKey() {
                 }
             } else {
                 switch (seq[1]) {
-                case 'A': return ARROW_UP;
-                case 'B': return ARROW_DOWN;
-                case 'C': return ARROW_RIGHT;
-                case 'D': return ARROW_LEFT;
-                case 'H': return HOME_KEY;
-                case 'F': return END_KEY;
+                    case 'A': return ARROW_UP;
+                    case 'B': return ARROW_DOWN;
+                    case 'C': return ARROW_RIGHT;
+                    case 'D': return ARROW_LEFT;
+                    case 'F': return END_KEY;
+                    case 'H': return HOME_KEY;
                 }
             }
         } else if (seq[0] == 'O') {
-            // <esc>-O???
+            // <esc>-O??? I think this is for the numpad home/enter for the VT100
             switch (seq[1]) {
                 case 'H': return HOME_KEY;
                 case 'F': return END_KEY;
             }
         }
-        // just the escape character, somehow?
-        return '\x1b';
+        return UNKNOWN_THREE_CHAR;
     } else {
         return c;
     }
 }
 
-void editorMoveCursor(int key) {
-    // move and clamp cursor position.
-    // handle scrolling, wrapping.
-    switch (key) {
-        case ARROW_LEFT:
-            if (E.cx == 0 && currentRow() != 0) {
-                int oldRow = physicalRow();
-                // balance scroll
-                if (E.cy != 0) {
-                    E.cy--;
-                } else if (E.scroll != 0) {
-                    E.scroll--;
-                }
-
-                // shift it to the last character if this is a different physical line, otherwise skip last position
-                if (oldRow == physicalRow())
-                    E.cx = E.lline[currentRow()].size-1;
-                else
-                    E.cx = E.lline[currentRow()].size;
-            } else if (E.cx != 0)
-                // if not at the first position, go left
-                E.cx--;
-            break;
-        case ARROW_RIGHT:
-            if (currentRow() != E.numllines) {
-                if (E.cx == E.lline[currentRow()].size || (E.cx == E.lline[currentRow()].size - 1 && currentRow() != E.numllines-1 && E.lline[currentRow()+1].offset != 0)) {
-                    // if this is either:
-                    // 1. the last character in the last lline of a row
-                    // 2. the second to last character of NOT the last lline in a row, or the last lline in general
-                    // then change line and go to start of lline
-
-                    // balance scroll
-                    if (E.cy != E.screenrows - 2) {
-                        E.cy++;
-                    } else {
-                        E.scroll++;
-                    }
-
-                    // dirty fix if it made a mistake
-                    if (E.cx == E.lline[currentRow()-1].size && currentRow()-1 != E.numllines-1 && E.lline[currentRow()].offset != 0)
-                        E.cx = 1;
-                    else
-                        E.cx = 0;
-                    
-                } else 
-                    // go right normally
-                    E.cx++;
-            }
-            break;
-        case ARROW_UP:
-            if (E.cy != 0) {
-                E.cy--;
-            } else if (E.scroll != 0) {
-                E.scroll--;
-            }
-            if (currentRow() != E.numllines && E.cx > E.lline[currentRow()].size) {
-                E.cx = E.lline[currentRow()].size;
-            }
-            break;
-        case ARROW_DOWN:
-            if (currentRow() != E.numllines) {
-                if (E.cy != E.screenrows - 2) {
-                    E.cy++;
-                } else {
-                    E.scroll++;
-                }
-                if (currentRow() != E.numllines && E.cx > E.lline[currentRow()].size) {
-                    E.cx = E.lline[currentRow()].size;
-                } else if (currentRow() == E.numllines) E.cx = 0;
-            }
-            break;
-        case HOME_KEY:
-            {
-                // we go back until the lline that starts the row
-                int homeLLine = currentRow();
-                while (E.lline[homeLLine].offset != 0) homeLLine--;
-
-                // we set the x to 0 of course
-                E.cx = 0;
-
-                // we move the cursor there, accounting for scroll
-                E.cy = homeLLine-E.scroll;
-
-                // if the cursor is off screen because of the scroll, scroll until it's at the top again
-                if (E.cy < 0) {
-                    E.scroll += E.cy;
-                    E.cy = 0;
-                }
-            }
-            break;
-        case END_KEY:
-            if (currentRow() != E.numllines) {
-                // we go forward until the lline that starts the NEXT row, then we go back one lline
-                int endLLine = currentRow();
-                while (endLLine != E.numllines && E.lline[endLLine].refIdx == E.lline[currentRow()].refIdx) endLLine++;
-                endLLine--;
-
-                // we set the x to the length of the lline
-                E.cx = E.lline[endLLine].size;
-
-                // we move the cursor there, accounting for scroll
-                E.cy = endLLine-E.scroll;
-
-                // if the cursor is off screen because of the scroll, scroll until it's at the bottom again
-                if (E.cy > E.screencols) {
-                    E.scroll -= (E.cy - E.screencols + 1);
-                    E.cy = E.screencols - 1;
-                }
-            }
-            break;
+void recomputeByteOffset() {
+    if (currentLLine() >= E.numllines) {
+        E.bidx = 0;
+        return;
+    }
+    
+    elline *l = &E.lline[currentLLine()];
+    E.bidx = l->offset;
+    char *chars = E.row[l->refIdx].chars;
+    
+    for (int i = 0; i < E.cx; ++i) {
+        E.bidx += utf8_next(chars, E.bidx);
     }
 }
 
-void editorType(int c) {
-    if (currentRow() != E.numllines) {
-        int row = physicalRow();
-        int pos = physicalRowOffset() + E.cx;
+void editorScrollView() {
+    int usefulHeight = E.screenrows - 2;
+    if (usefulHeight < 0) usefulHeight = 0; // hmmmm
 
+    int targetLine = currentLLine();
+    if (targetLine < 0) targetLine = 0;
+    if (targetLine > E.numllines) targetLine = E.numllines;
+
+    if (targetLine < E.scroll) {
+        E.scroll = targetLine;
+        E.cy = 0;
+    } else if (targetLine > E.scroll + usefulHeight) {
+        E.scroll = targetLine - usefulHeight;
+        E.cy = usefulHeight;
+    } else {
+        E.cy = targetLine - E.scroll;
+    }
+}
+
+void editorMoveCursor(int key) {
+    int recompute = 0;
+
+    switch (key) {
+        case ARROW_LEFT:
+            if (E.cx > 0) {
+                E.cx--;
+                if (physicalRow() != -1) {
+                    E.bidx -= utf8_prev(E.row[physicalRow()].chars, E.bidx);
+                }
+            } else if (currentLLine() > 0) {
+                int old_row = physicalRow();
+                E.cy--;
+                int prev_row = physicalRow();
+                
+                E.cx = (prev_row == old_row) ? (E.lline[currentLLine()].phys_size - 1) : E.lline[currentLLine()].phys_size;
+                recompute = 1;
+            }
+            break;
+
+        case ARROW_RIGHT:
+            if (currentLLine() != E.numllines) {
+                elline *l = &E.lline[currentLLine()];
+
+                if (E.cx >= l->phys_size || (E.cx == l->phys_size - 1 && currentLLine() < E.numllines - 1 && E.lline[currentLLine() + 1].offset != 0)) {
+                    if (currentLLine() != E.numllines - 1) {
+                        E.cy++;
+                        E.cx = (E.cx == l->phys_size && E.lline[currentLLine()].offset != 0) ? 1 : 0;
+                        recompute = 1;
+                    }
+                } else {
+                    E.cx++;
+                    E.bidx += utf8_next(E.row[physicalRow()].chars, E.bidx);
+                }
+            }
+            break;
+
+        case ARROW_UP:
+            if (currentLLine() > 0) {
+                E.cy--;
+                if (E.cx > E.lline[currentLLine()].phys_size) {
+                    E.cx = E.lline[currentLLine()].phys_size;
+                }
+                recompute = 1;
+            }
+            break;
+
+        case ARROW_DOWN:
+            if (currentLLine() != E.numllines) {
+                E.cy++;
+                if (currentLLine() < E.numllines) {
+                    if (E.cx > E.lline[currentLLine()].phys_size) {
+                        E.cx = E.lline[currentLLine()].phys_size;
+                    }
+                } else {
+                    E.cx = 0;
+                }
+                recompute = 1;
+            }
+            break;
+
+        case HOME_KEY:
+            while (currentLLine() > 0 && E.lline[currentLLine()].offset != 0) {
+                E.cy--;
+            }
+            E.cx = 0;
+            recompute = 1;
+            break;
+
+        case END_KEY:
+            if (currentLLine() < E.numllines) {
+                int target_row = E.lline[currentLLine()].refIdx;
+                while (currentLLine() < E.numllines && E.lline[currentLLine()].refIdx == target_row) {
+                    E.cy++;
+                }
+                E.cy--;
+                E.cx = E.lline[currentLLine()].phys_size;
+                recompute = 1;
+            }
+            break;
+    }
+
+    editorScrollView();
+
+    if (1) {
+        recomputeByteOffset();
+    }
+}
+
+// TODO (URGENT): fix speed. this goes through ALL ROWS EVERY KEYPRESS. 
+// AND it allows for the disallowed position at the end of the row.
+void repositionCursor(int row, int byte) {
+    int y=0;
+    while (y < E.numllines && E.lline[y].refIdx != row)
+        y++;
+
+    if (y == E.numllines) return;
+    
+    while (y + 1 < E.numllines &&
+           E.lline[y + 1].refIdx == row &&
+           E.lline[y + 1].offset <= byte)
+    {
+        y++;
+    }
+
+    E.cy = y - E.scroll;
+    
+    int b_offset = E.lline[y].offset;
+    E.cx = 0;
+
+    while (b_offset < byte) {
+        b_offset += utf8_next(E.row[E.lline[y].refIdx].chars, b_offset);
+        E.cx++;
+    }
+
+    
+}
+
+void editorType(int c) {
+    int row = physicalRow();
+    int pos = E.bidx;
+
+    if (currentLLine() != E.numllines) {
         int len = E.row[row].size;
 
-        // make space for the new letter, unless replacing an existing one
+        // make space for the new byte, unless replacing an existing one
         if (!E.insMode || pos == len) {
             E.row[row].size = len+1;
             E.row[row].chars = realloc(E.row[row].chars, len+1);
+
+            // shift all the bytes after this forward by one
             memmove(E.row[row].chars + pos + 1, E.row[row].chars + pos, len-pos);
         }
 
         // put the new letter in!
         E.row[row].chars[pos] = c;
+
+        // move the logical byte cursor forward
+        E.bidx++;
     } else {
         // if typing on a tilde-row, spawn a new row and add the letter
         char buf[1];
         buf[0] = c;
+        row = E.numrows;
+
+        // spawn a new row
         editorAppendRow(buf, 1);
+        
+        // move the logical byte cursor forward
+        E.bidx++;
     }
+    
     // recompute the logical lines
     editorComputeLLines();
 
-    // move the cursor to the right
-    editorMoveCursor(ARROW_RIGHT);
-
-    // increment the character count
-    E.charcount++;
+    // reposition the cursor
+    repositionCursor(row, E.bidx);
+    
+    // trigger the edit flag
+    E.editflag = 1;
 }
 
 void editorNewline() {
     int row = physicalRow();
-    int pos = physicalRowOffset() + E.cx;
+    int pos = E.bidx; // This is in bytes ! It's the byte offset in the line.
 
-    if (currentRow() != E.numllines) {
+    if (currentLLine() != E.numllines) {
+        // if doing newline mid-row, we have to split it
+        // if it's at the last character, we still split it, but don't do anything with the right hand.
+
         int len = E.row[row].size;
+
+        // we create a buffer where we copy the row's content, since the original will be lost
         char *buf;
         buf = malloc(len);
         memcpy(buf, E.row[row].chars, len);
 
-        int lh = len;
-        if (pos < lh) lh = pos;
+        // the left-hand of the split - gets as long as where the cursor is.
+        int lh = pos;
 
+        // we create a new row at the same position (pushing the other forward)
+        // and fill it with the left-hand part's content.
         editorInsertRow(buf, lh, row);
 
+        // the right-hand of the split - starts at byte lh, and is rh bytes long.
         int rh = len-lh;
-        free(E.row[row+1].chars);
-        E.row[row+1].chars  = malloc(rh);
-        memcpy(E.row[row+1].chars, buf+lh, rh);
-        free(buf);
-        E.row[row+1].size = rh;
-        
-        if (E.cy != E.screenrows - 2) {
-            E.cy++;
-        } else {
-            E.scroll++;
-        }
 
-        E.cx = 0;
+        // begin the procedure to replace the new row (actually the old one, but pushed forward)'s content.
+        // free old content
+        free(E.row[row+1].chars);
+        // malloc new buffer - length rh
+        E.row[row+1].chars = malloc(rh);
+        // copy the right-hand section of the buffer (the part that was left behind earlier)
+        memcpy(E.row[row+1].chars, buf+lh, rh);
+        // adjust the row's size
+        E.row[row+1].size = rh;
+
+        // free the buffer obviously
+        free(buf);
     } else {
         // if doing newline on a tilde-row, spawn a new empty row
         editorAppendRow(NULL, 0);
-        E.cx = 0; // should alr be 0
-        // go to the newline and balance for scroll
-        if (E.cy != E.screenrows - 2) {
-            E.cy++;
-        } else {
-            E.scroll++;
-        }
+  
     }
+
+    // recompute the logical lines
     editorComputeLLines();
+
+    // reposition the cursor to the new line
+    repositionCursor(row+1, 0);
+
+    E.editflag = 1;
 }
 
 void editorMergeLines(int row) {
@@ -650,73 +819,118 @@ void editorMergeLines(int row) {
 }
 
 void editorBackspace() {
-    if (currentRow() == E.numllines) {
-        editorMoveCursor(ARROW_LEFT);
+    // If pressing backspace on a newline, just go to the line before.
+    if (currentLLine() == E.numllines) {
+        // move cursor up
+        E.cy--;
+
+        // move the cursor at the end of the line
+        E.cx = E.lline[currentLLine()].size;
+
+        // adjust scrolling
+        editorScrollView();
         return;
     }
 
     int row = physicalRow();
-    int pos = physicalRowOffset() + E.cx;
+    int pos = E.bidx;
+
+    // How many bytes need to be deleted
+    int delta = utf8_prev(E.row[row].chars, pos);
 
     if (pos != 0) {
         // can delete characters before it
-        int old_ref = E.lline[currentRow()].refIdx;
-        memmove(E.row[row].chars + pos - 1, E.row[row].chars + pos, E.row[row].size-pos);
-        E.row[row].size--;
+
+        // move all the bytes right before this position back by the delta, removing the bytes in the delta from existance
+        memmove(E.row[row].chars + pos - delta, E.row[row].chars + pos, E.row[row].size - pos);
+        E.row[row].size -= delta;
+
+        // recompute the logical lines
         editorComputeLLines();
 
-        editorMoveCursor(ARROW_LEFT);
+        // move the logical byte cursor backward
+        E.bidx-=delta;
 
-        // fix the fact that when you empty an lline it gets confused and doesn't go up because it,
-        //rightfully, sticks to the zeroth character, forgetting that now it's not the EOL
-        if (E.cx == 0 && (currentRow() == E.numllines || E.lline[currentRow()].refIdx != old_ref)) editorMoveCursor(ARROW_LEFT);
-        E.charcount--;
-    } else if (currentRow() != 0) {
+        // reposition the cursor
+        repositionCursor(row, E.bidx);
+    } else if (currentLLine() != 0) {
+        // if at the first position and not in the first line, 
         // merge two lines, deleting the newline, puts the cursor after the first line
-        E.cx =  E.lline[currentRow()-1].size;
 
-        if (E.cy != 0) {
-            E.cy--;
-        } else if (E.scroll != 0) {
-            E.scroll--;
-        }
+        // move cursor up
+        E.cy--;
 
+        // move the cursor at the end of the line
+        E.cx = E.lline[currentLLine()].size;
+
+        // adjust scrolling
+        editorScrollView();
+
+        // merge the line with the one before it
         editorMergeLines(row);
     }
+
+    E.editflag = 1;
 }
 
 void editorDelete() {
-    if (currentRow() == E.numllines) return;
+    // If trying to delete a nonexistant line, return
+    if (currentLLine() == E.numllines) return;
 
     int row = physicalRow();
-    int pos = physicalRowOffset() + E.cx;
+    int pos = E.bidx;
 
-    if (E.cx != E.lline[currentRow()].size) {
+    // How many bytes need to be deleted
+    int delta = utf8_next(E.row[row].chars, pos);
+
+    if (E.cx != E.lline[currentLLine()].size) {
         // can delete characters after it
-        memmove(E.row[row].chars + pos, E.row[row].chars + pos + 1, E.row[row].size-pos - 1);
-        E.row[row].size--;
-        editorComputeLLines();
 
-        E.charcount--;
-    } else if (currentRow() != E.numllines-1) {
+        // move all the bytes after this position back by the delta, removing the bytes in the delta from existance
+        memmove(E.row[row].chars + pos, E.row[row].chars + pos + delta, E.row[row].size - pos - delta);
+        E.row[row].size -= delta;
+
+        // recompute the logical lines
+        editorComputeLLines();
+    } else if (currentLLine() != E.numllines-1) {
         // merge two lines, deleting the newline, puts the cursor after the first line
         editorMergeLines(row+1);
     }
+
+    E.editflag = 1;
 }
 
 void editorProcessKeypress() {
     int c = editorReadKey();
-    E.lastKeypress = c;
+    E.lastkey = c;
 
     switch (c) {
+        case UNKNOWN_THREE_CHAR:
+        case UNKNOWN_TWO_CHAR:
+            break;
+        
+        case ESCAPE_KEY:
+            break;
+
         case CTRL_KEY('q'):
             // Ctrl-Q to quit
-            clearScreen();
-            exit(0);
+            if (E.editflag) {
+                // if modified, prompt the user (TODO)
+                clearScreen();
+                exit(0);
+            } else {
+                clearScreen();
+                exit(0);
+            }
             break;
         case CTRL_KEY('s'):
             // Ctrl-S to save
-            editorSave(E.filename);
+            if (E.filename == NULL) {
+                // prompt the user to enter a filename
+                
+            } else {
+                editorSave(E.filename);
+            }
             break;
         case PAGE_UP:
         case PAGE_DOWN:
@@ -744,6 +958,8 @@ void editorProcessKeypress() {
         case '\r':
             editorNewline();
             break;
+        case '\t':
+            break;
         default:
             editorType(c);
     }
@@ -754,6 +970,7 @@ void editorProcessKeypress() {
 void initEditor() {
     E.cx = 0;
     E.cy = 0;
+    E.bidx = 0;
     E.numrows = 0;
     E.row = NULL;
     E.numllines = 0;
@@ -762,8 +979,9 @@ void initEditor() {
     E.insMode = 0;
     E.wordcount = 0;
     E.charcount = 0;
-    E.lastKeypress = 0x0;
-    E.statusMessage = 0;
+    E.lastkey = 0x0;
+    E.statusmsg = 0;
+    E.editflag = 0;
 
     if (getWindowSize(&E.screenrows, &E.screencols) == -1) die("getWindowSize");
 }
@@ -776,7 +994,7 @@ int main(int argc, char *argv[]) {
         E.filename = argv[1];
         editorOpen(E.filename);
     } else {
-        E.filename = "test.txt";
+        E.filename = NULL;
     }
 
     while (1) {
