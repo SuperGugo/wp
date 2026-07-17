@@ -219,87 +219,115 @@ int getWindowSize(int *rows, int *cols) {
 
 /* logical line processing */
 
+// Argue me
 int isPunctuation(char c) {
     // can i wrap on this character?
     return c == ' ' || c == ',' || c == '.' || c == ';' || c == ':' || c == '/' || c == '-' || c == '?' || c == '!';
 }
 
-void editorAppendLLine(int refIdx, int start, size_t len, int startcol, size_t collen) {
+void editorAppendLLine(int refIdx, int start, size_t len, int phys_start, size_t phys_len) {
     E.lline = realloc(E.lline, sizeof(elline) * (E.numllines + 1));
     int at = E.numllines;
     E.lline[at].size = len;
     E.lline[at].refIdx = refIdx;
     E.lline[at].offset = start;
-    E.lline[at].phys_size = collen;
-    E.lline[at].phys_offset = startcol;
+    E.lline[at].phys_size = phys_len;
+    E.lline[at].phys_offset = phys_start;
     E.numllines++;
 }
 
 // TODO: maybe don't recompute ALL THE LLINES, iterating EVERY CHARACTER, for every keypress?
 void editorComputeLLines() {
+    // free old llines
     free(E.lline);
+    E.lline = NULL;
 
     // We also count lines, words and characters while recomputing llines, since we go over all of them.
+    // So we zero them now and increment them in the compute loop.
     E.numllines = 0;
-    E.wordcount = 0;
     E.charcount = 0;
-
-    E.lline = NULL;
+    E.wordcount = 1;
+    
     for (int y = 0; y < E.numrows; ++y) {
-        int len = E.row[y].size;
-        E.row[y].columns = 0;
+        int size = E.row[y].size;       // The size IN BYTES of the physical row
+        char* chars = E.row[y].chars;   // the chars of the row
 
-        E.bytecount += len; // add the row's size (in bytes) to the byte counter
+        // add the row's size (in bytes) to the byte counter
+        E.bytecount += size;
 
-        // if the row is too long, wrap it
-        int lastspc = 0;
-        int llen = 0; // length of current logical line
-        int lstart = 0; // start of the current logical line
 
-        int lastcol = 0;
-        int columns = 0; // the actual rendered columns, for utf-8
+        int last_break = 0;         // The BYTE at which the last line break occurred. (Or, the BYTE where the current lline starts.)
+        int last_space = 0;         // The BYTE where the last whitespace occurred (meaning we can break there!)
 
-        for (int x = 0; x < len;) {
-            /*
-            // divide at punctuation
-            if (isPunctuation(E.row[y].chars[x]))  {
-                // cutting here would overflow. cut at the last valid position.
-                // if the last word is too long to fit in the line anyway, even if it was alone, then it is to be split
-                if (x-lstart+1 >= E.screencols 
-                    //&& x-lastspc < E.screencols
-                ) {
-                    if (lastspc-lstart+1 >= E.screencols) {
-                        // if the single word is larger than the goddamn screen split it
-                        editorAppendLLine(y, lstart, E.screencols-1);
-                        lstart += E.screencols-1;
-                    } else {
-                        // wrap normally
-                        editorAppendLLine(y, lstart, lastspc-lstart+1);
-                        lstart = lastspc+1;
+        int phys_last_break = 0;    // The CHARACTER at which the last line break occurred.
+        int phys_last_space = 0;    // Come on, you can figure this out.
+
+        int phys_x = 0;             // Just an iterator, in CHARACTERS, of the position in the current row.
+
+        for (int x = 0; x < size;) {
+            int phys_len = phys_x - phys_last_break;
+
+            // TODO: remove dead code (I'm keeping it [uncommented] for reference)
+            if (1) {
+                /* Punctuation-based wrapping (for word processing) */
+
+                // Basically we want to always split at words, meaning that if a word goes out of
+                // screen, we chop the lline before that word starts and start a new lline.
+                
+                // When I find a space, iterating thru the row:
+                if (chars[x] == ' ' || x == size-1)  {
+                    if (phys_len >= E.screencols) {
+                        int len = last_space - last_break + 1;
+                        int phys_word_length = phys_last_space - phys_last_break + 1;
+
+                        // We went over the edge with this word, but we didn't with the last. Chop at last_space!
+                        editorAppendLLine(y, last_break, len, phys_last_break, phys_word_length);
+
+                        // get ready for a new lline!
+                        last_break = last_space + 1;
+                        phys_last_break = phys_last_space + 1;
                     }
+
+                    // Store where the last space was (in bytes!)
+                    last_space = x;
+                    phys_last_space = phys_x;
+
+                    // Increment the word count
+                    E.wordcount++;
                 }
+            } else { 
+                /* Fixed-row-length wrapping (for code editors and such)*/
 
-                lastspc = x; // blocks of punctuation stick together.
-                //while (isPunctuation(E.row[y].chars[x++]));
+                // If the length of the lline is that of the viable screen size, we have to split it.
+                if (phys_len == E.screencols-1) {
+                    int len = x - phys_last_break;
 
-                E.wordcount++;
+                    // Append this lline to the array
+                    editorAppendLLine(y, last_break, len, phys_last_break, phys_len);
+
+                    // get ready for a new lline!
+                    last_break = x;
+                    phys_last_break = phys_x;
+                }
             }
-            */
-            if (columns == 30) {
-                editorAppendLLine(y, lastspc, x-lastspc, lastcol, columns);
-                lastspc = x;
-                lastcol += columns;
-                columns = 0;
-            }
-            int add = utf8_next(E.row[y].chars, x);
-            if (add == 0) break;
-            x += add;
-            columns++;
+
+            // How many bytes will the next character take?
+            int delta = utf8_next(chars, x);
+            if (delta == 0) break; // this is useless
+
+            x += delta; // increment the byte iterator by how many bytes this character took
+            phys_x++;   // increment the character iterator by one
+
+            // increment character count and row character count
             E.charcount++;
-            E.row[y].columns++;
+            
         }
 
-        editorAppendLLine(y, lastspc, len-lastspc, lastcol, columns);
+        // append the last bits, the remainder
+        editorAppendLLine(y, last_break, size - last_break, phys_last_break, phys_x - phys_last_break);
+
+        // set the row's size in characters
+        E.row[y].columns = phys_x;
     }
 }
 
