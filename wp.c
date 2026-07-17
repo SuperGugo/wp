@@ -582,6 +582,12 @@ void editorScrollView() {
     }
 }
 
+int maxCx(int llineIdx) {
+    int disallowed = (llineIdx + 1 < E.numllines) &&
+                      (E.lline[llineIdx + 1].refIdx == E.lline[llineIdx].refIdx);
+    return disallowed ? E.lline[llineIdx].phys_size - 1 : E.lline[llineIdx].phys_size;
+}
+
 void editorMoveCursor(int key) {
     int recompute = 0;
 
@@ -606,7 +612,7 @@ void editorMoveCursor(int key) {
             if (currentLLine() != E.numllines) {
                 elline *l = &E.lline[currentLLine()];
 
-                if (E.cx >= l->phys_size || (E.cx == l->phys_size - 1 && currentLLine() < E.numllines - 1 && E.lline[currentLLine() + 1].offset != 0)) {
+                if (E.cx >= maxCx(currentLLine())) {
                     if (currentLLine() != E.numllines - 1) {
                         E.cy++;
                         E.cx = (E.cx == l->phys_size && E.lline[currentLLine()].offset != 0) ? 1 : 0;
@@ -625,6 +631,7 @@ void editorMoveCursor(int key) {
                 if (E.cx > E.lline[currentLLine()].phys_size) {
                     E.cx = E.lline[currentLLine()].phys_size;
                 }
+                int m = maxCx(currentLLine()); if (E.cx > m) E.cx = m;
                 recompute = 1;
             }
             break;
@@ -636,6 +643,7 @@ void editorMoveCursor(int key) {
                     if (E.cx > E.lline[currentLLine()].phys_size) {
                         E.cx = E.lline[currentLLine()].phys_size;
                     }
+                    int m = maxCx(currentLLine()); if (E.cx > m) E.cx = m;
                 } else {
                     E.cx = 0;
                 }
@@ -688,6 +696,7 @@ void repositionCursor(int row, int byte) {
     }
 
     E.cy = y - E.scroll;
+    E.bidx = byte;  
     
     int b_offset = E.lline[y].offset;
     E.cx = 0;
@@ -825,7 +834,7 @@ void editorBackspace() {
         E.cy--;
 
         // move the cursor at the end of the line
-        E.cx = E.lline[currentLLine()].size;
+        E.cx = E.lline[currentLLine()].phys_size;
 
         // adjust scrolling
         editorScrollView();
@@ -857,17 +866,23 @@ void editorBackspace() {
         // if at the first position and not in the first line, 
         // merge two lines, deleting the newline, puts the cursor after the first line
 
-        // move cursor up
-        E.cy--;
+        // if it will land in The Cursed Position then just don't move the cursor at all
+        if (E.lline[currentLLine()-1].phys_size != E.screencols) { // watch out: when ill do words, it will have to use a "wrap" property in the elline (TODO)
+            // move cursor up
+            E.cy--;
 
-        // move the cursor at the end of the line
-        E.cx = E.lline[currentLLine()].size;
+            // move the cursor at the end of the line
+            E.cx = E.lline[currentLLine()].phys_size;
+        }
 
         // adjust scrolling
         editorScrollView();
 
         // merge the line with the one before it
         editorMergeLines(row);
+
+        // recomute the byte offset now that the lines are merged
+        recomputeByteOffset();
     }
 
     E.editflag = 1;
